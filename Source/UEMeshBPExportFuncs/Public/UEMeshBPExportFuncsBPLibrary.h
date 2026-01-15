@@ -28,5 +28,5 @@ class UUEMeshBPExportFuncsBPLibrary : public UBlueprintFunctionLibrary
 	GENERATED_UCLASS_BODY()
 
 	UFUNCTION(BlueprintCallable, CallInEditor, meta = (DisplayName = "Export Skeletal Meshes", Keywords = "export fbx skeletal mesh"), Category = "UEMeshBPExportFuncs")
-	static bool ExportSkelMeshes(AActor* Actor, const FString& ExportPath, int32 TextureSizeLimit = 4096);
+	static bool ExportSkelMeshes(AActor* Actor, const FString& ExportName, const FString& ExportPath);
 };
