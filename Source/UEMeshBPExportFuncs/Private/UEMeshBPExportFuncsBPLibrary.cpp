@@ -28,7 +28,6 @@
 #include "Exporters/FbxExportOption.h"
 #include "Animation/AnimSequence.h"
 #include "Animation/AnimSingleNodeInstance.h"
-#include "FbxExporter.h"
 #endif
 
 UUEMeshBPExportFuncsBPLibrary::UUEMeshBPExportFuncsBPLibrary(const FObjectInitializer& ObjectInitializer)
