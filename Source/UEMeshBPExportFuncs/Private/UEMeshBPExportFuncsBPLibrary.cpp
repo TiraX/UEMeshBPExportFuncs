@@ -26,8 +26,13 @@
 #include "TextureResource.h"
 #include "ImageUtils.h"
 #include "Exporters/FbxExportOption.h"
+#include "Factories/FbxImportUI.h"
 #include "Animation/AnimSequence.h"
 #include "Animation/AnimSingleNodeInstance.h"
+#include "AssetImportTask.h"
+#include "Factories/FbxFactory.h"
+#include "AssetToolsModule.h"
+#include "IAssetTools.h"
 #endif
 
 UUEMeshBPExportFuncsBPLibrary::UUEMeshBPExportFuncsBPLibrary(const FObjectInitializer& ObjectInitializer)
@@ -442,6 +447,132 @@ bool UUEMeshBPExportFuncsBPLibrary::ExportSkelMeshes(AActor* Actor, const FStrin
 	
 #else
 	UE_LOG(LogTemp, Error, TEXT("ExportSkelMeshes: This function is only available in Editor"));
+	return false;
+#endif
+}
+
+TArray<FString> UUEMeshBPExportFuncsBPLibrary::ListFiles(const FString& Path, const FString& FilterString, bool bRecursive)
+{
+	TArray<FString> Result;
+	
+	// Check if path exists
+	if (!FPaths::DirectoryExists(Path))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ListFiles: Directory does not exist: %s"), *Path);
+		return Result;
+	}
+	
+	// Prepare search pattern
+	FString SearchPattern = FilterString.IsEmpty() ? TEXT("*.*") : FilterString;
+	FString FullSearchPath = FPaths::Combine(Path, SearchPattern);
+	
+	// Find files in current directory
+	IFileManager& FileManager = IFileManager::Get();
+	
+	if (bRecursive)
+	{
+		// Recursive search
+		FileManager.FindFilesRecursive(Result, *Path, *SearchPattern, true, false);
+	}
+	else
+	{
+		// Non-recursive search
+		TArray<FString> FoundFiles;
+		FileManager.FindFiles(FoundFiles, *FullSearchPath, true, false);
+		
+		// Convert relative paths to full paths
+		for (const FString& FileName : FoundFiles)
+		{
+			Result.Add(FPaths::Combine(Path, FileName));
+		}
+	}
+	
+	return Result;
+}
+
+bool UUEMeshBPExportFuncsBPLibrary::ImportMesh(const FString& TargetUEPath, const FString& MeshPath, bool bImportMaterial, bool bImportTexture, bool bImportSkeleton, UObject* ParentMaterialAsset)
+{
+#if WITH_EDITOR
+	// Check if file exists
+	if (!FPaths::FileExists(MeshPath))
+	{
+		UE_LOG(LogTemp, Error, TEXT("ImportMesh: File does not exist: %s"), *MeshPath);
+		return false;
+	}
+	
+	// Check if file is FBX
+	FString Extension = FPaths::GetExtension(MeshPath).ToLower();
+	if (Extension != TEXT("fbx"))
+	{
+		UE_LOG(LogTemp, Error, TEXT("ImportMesh: Only FBX files are supported, got: %s"), *Extension);
+		return false;
+	}
+	
+	// Create FBX factory
+	UFbxFactory* FbxFactory = NewObject<UFbxFactory>();
+	if (!FbxFactory)
+	{
+		UE_LOG(LogTemp, Error, TEXT("ImportMesh: Failed to create FbxFactory"));
+		return false;
+	}
+	
+	// Configure import settings
+	FbxFactory->EnableShowOption();
+	if (FbxFactory->ImportUI)
+	{
+		// Disable material import for now
+		FbxFactory->ImportUI->bImportAsSkeletal = bImportSkeleton;
+		FbxFactory->ImportUI->bImportMaterials = bImportMaterial;
+		FbxFactory->ImportUI->bImportTextures = bImportTexture;
+		FbxFactory->ImportUI->bImportAnimations = false;
+		FbxFactory->ImportUI->bCreatePhysicsAsset = false;
+		
+		// Set automated import
+		FbxFactory->ImportUI->bAutomatedImportShouldDetectType = true;
+	}
+	
+	// Create import task
+	UAssetImportTask* ImportTask = NewObject<UAssetImportTask>();
+	ImportTask->AddToRoot();
+	ImportTask->bAutomated = true;
+	ImportTask->bReplaceExisting = true;
+	ImportTask->bSave = false;
+	ImportTask->Filename = MeshPath;
+	ImportTask->DestinationPath = TargetUEPath;
+	ImportTask->Factory = FbxFactory;
+	ImportTask->Options = FbxFactory->ImportUI;
+	
+	// Set factory import task
+	FbxFactory->SetAssetImportTask(ImportTask);
+	
+	// Execute import
+	FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
+	TArray<UAssetImportTask*> ImportTasks;
+	ImportTasks.Add(ImportTask);
+	AssetToolsModule.Get().ImportAssetTasks(ImportTasks);
+	
+	// Check if import was successful
+	bool bSuccess = ImportTask->ImportedObjectPaths.Num() > 0;
+	
+	if (bSuccess)
+	{
+		UE_LOG(LogTemp, Log, TEXT("ImportMesh: Successfully imported %d objects from %s"), ImportTask->ImportedObjectPaths.Num(), *MeshPath);
+		for (const FString& ObjectPath : ImportTask->ImportedObjectPaths)
+		{
+			UE_LOG(LogTemp, Log, TEXT("  - %s"), *ObjectPath);
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("ImportMesh: Failed to import mesh from %s"), *MeshPath);
+	}
+	
+	// Clean up
+	ImportTask->RemoveFromRoot();
+	
+	return bSuccess;
+#else
+	UE_LOG(LogTemp, Error, TEXT("ImportMesh: This function is only available in editor builds"));
 	return false;
 #endif
 }
