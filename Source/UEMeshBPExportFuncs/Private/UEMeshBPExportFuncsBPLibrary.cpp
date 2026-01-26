@@ -31,6 +31,8 @@
 #include "Animation/AnimSingleNodeInstance.h"
 #include "AssetImportTask.h"
 #include "Factories/FbxFactory.h"
+#include "Factories/FbxStaticMeshImportData.h"
+#include "Factories/FbxSkeletalMeshImportData.h"
 #include "AssetToolsModule.h"
 #include "IAssetTools.h"
 #endif
@@ -490,7 +492,7 @@ TArray<FString> UUEMeshBPExportFuncsBPLibrary::ListFiles(const FString& Path, co
 	return Result;
 }
 
-bool UUEMeshBPExportFuncsBPLibrary::ImportMesh(const FString& TargetUEPath, const FString& MeshPath, bool bImportMaterial, bool bImportTexture, bool bImportSkeleton, UObject* ParentMaterialAsset)
+bool UUEMeshBPExportFuncsBPLibrary::ImportMesh(const FString& TargetUEPath, const FString& MeshPath, bool bImportMaterial, bool bImportTexture, bool bImportSkeleton, UObject* ParentMaterialAsset, float Scale)
 {
 #if WITH_EDITOR
 	// Check if file exists
@@ -520,15 +522,26 @@ bool UUEMeshBPExportFuncsBPLibrary::ImportMesh(const FString& TargetUEPath, cons
 	FbxFactory->EnableShowOption();
 	if (FbxFactory->ImportUI)
 	{
-		// Disable material import for now
+		// Explicitly set import type for automated import
+		FbxFactory->ImportUI->bAutomatedImportShouldDetectType = false;
 		FbxFactory->ImportUI->bImportAsSkeletal = bImportSkeleton;
+		FbxFactory->ImportUI->MeshTypeToImport = bImportSkeleton ? FBXIT_SkeletalMesh : FBXIT_StaticMesh;
+		FbxFactory->ImportUI->bImportMesh = true;
+		
+		// Enforce material/texture/animation/physics import flags
 		FbxFactory->ImportUI->bImportMaterials = bImportMaterial;
 		FbxFactory->ImportUI->bImportTextures = bImportTexture;
 		FbxFactory->ImportUI->bImportAnimations = false;
 		FbxFactory->ImportUI->bCreatePhysicsAsset = false;
-		
-		// Set automated import
-		FbxFactory->ImportUI->bAutomatedImportShouldDetectType = true;
+
+		if (FbxFactory->ImportUI->StaticMeshImportData)
+		{
+			FbxFactory->ImportUI->StaticMeshImportData->ImportUniformScale = Scale;
+		}
+		if (FbxFactory->ImportUI->SkeletalMeshImportData)
+		{
+			FbxFactory->ImportUI->SkeletalMeshImportData->ImportUniformScale = Scale;
+		}
 	}
 	
 	// Create import task
@@ -576,4 +589,3 @@ bool UUEMeshBPExportFuncsBPLibrary::ImportMesh(const FString& TargetUEPath, cons
 	return false;
 #endif
 }
-

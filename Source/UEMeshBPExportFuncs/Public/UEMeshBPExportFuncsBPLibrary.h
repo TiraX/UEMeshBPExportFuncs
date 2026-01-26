@@ -34,5 +34,5 @@ class UUEMeshBPExportFuncsBPLibrary : public UBlueprintFunctionLibrary
 	static TArray<FString> ListFiles(const FString& Path, const FString& FilterString, bool bRecursive);
 	
 	UFUNCTION(BlueprintCallable, CallInEditor, meta = (DisplayName = "Import Mesh", Keywords = "import fbx mesh material texture skeleton"), Category = "UEMeshBPExportFuncs")
-	static bool ImportMesh(const FString& TargetUEPath, const FString& MeshPath, bool bImportMaterial, bool bImportTexture, bool bImportSkeleton, UObject* ParentMaterialAsset);
+	static bool ImportMesh(const FString& TargetUEPath, const FString& MeshPath, bool bImportMaterial, bool bImportTexture, bool bImportSkeleton, UObject* ParentMaterialAsset, float Scale);
 };
