@@ -35,6 +35,11 @@
 #include "Factories/FbxSkeletalMeshImportData.h"
 #include "AssetToolsModule.h"
 #include "IAssetTools.h"
+#include "Factories/TextureFactory.h"
+#include "Materials/MaterialInstanceConstant.h"
+#include "Engine/StaticMesh.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "UObject/SavePackage.h"
 #endif
 
 UUEMeshBPExportFuncsBPLibrary::UUEMeshBPExportFuncsBPLibrary(const FObjectInitializer& ObjectInitializer)
@@ -492,9 +497,353 @@ TArray<FString> UUEMeshBPExportFuncsBPLibrary::ListFiles(const FString& Path, co
 	return Result;
 }
 
-bool UUEMeshBPExportFuncsBPLibrary::ImportMesh(const FString& TargetUEPath, const FString& MeshPath, bool bImportMaterial, bool bImportTexture, bool bImportSkeleton, UObject* ParentMaterialAsset, float Scale)
+#if WITH_EDITOR
+// Helper function: Import texture from file path
+static UTexture2D* ImportTextureFromFile(const FString& FilePath, const FString& DestinationPath, bool bSRGB, TextureGroup LODGroup = TEXTUREGROUP_World)
+{
+	// Check if file exists
+	if (!FPaths::FileExists(FilePath))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ImportTextureFromFile: File does not exist: %s"), *FilePath);
+		return nullptr;
+	}
+	
+	// Get texture name from file path
+	FString TextureName = FPaths::GetBaseFilename(FilePath);
+	FString PackageName = DestinationPath / TextureName;
+	
+	// Check if texture already exists
+	UPackage* ExistingPackage = FindPackage(nullptr, *PackageName);
+	if (ExistingPackage)
+	{
+		UTexture2D* ExistingTexture = FindObject<UTexture2D>(ExistingPackage, *TextureName);
+		if (ExistingTexture)
+		{
+			UE_LOG(LogTemp, Log, TEXT("Texture already exists, skipping: %s"), *PackageName);
+			return ExistingTexture;
+		}
+	}
+	
+	// Create texture factory
+	UTextureFactory* TextureFactory = NewObject<UTextureFactory>();
+	TextureFactory->SuppressImportOverwriteDialog();
+	TextureFactory->bUseHashAsGuid = true;
+	
+	// Load texture data
+	TArray<uint8> FileData;
+	if (!FFileHelper::LoadFileToArray(FileData, *FilePath))
+	{
+		UE_LOG(LogTemp, Error, TEXT("Failed to load texture file: %s"), *FilePath);
+		return nullptr;
+	}
+	
+	// Create package
+	UPackage* Package = CreatePackage(*PackageName);
+	Package->FullyLoad();
+	
+	// Import texture
+	const uint8* BufferStart = FileData.GetData();
+	const uint8* BufferEnd = BufferStart + FileData.Num();
+	
+	UTexture2D* Texture = Cast<UTexture2D>(TextureFactory->FactoryCreateBinary(
+		UTexture2D::StaticClass(),
+		Package,
+		*TextureName,
+		RF_Standalone | RF_Public,
+		nullptr,
+		*FPaths::GetExtension(FilePath),
+		BufferStart,
+		BufferEnd,
+		nullptr
+	));
+	
+	if (Texture)
+	{
+		// Set texture properties
+		Texture->SRGB = bSRGB;
+		Texture->CompressionSettings = bSRGB ? TC_Default : TC_Normalmap;
+		Texture->LODGroup = LODGroup;
+		
+		// Notify asset registry
+		FAssetRegistryModule::AssetCreated(Texture);
+		Package->MarkPackageDirty();
+		
+		UE_LOG(LogTemp, Log, TEXT("Successfully imported texture: %s"), *PackageName);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("Failed to import texture: %s"), *FilePath);
+	}
+	
+	return Texture;
+}
+
+// Helper function: Extract relative path and import texture
+static UTexture2D* ImportTextureWithRelativePath(const FString& _TexturePath, const FString& _TargetUEPath, const FString& SourceFbxPath, bool bSRGB, TextureCompressionSettings CompressionSettings = TC_Default, TextureGroup LODGroup = TEXTUREGROUP_World)
+{
+	FString TexturePath = _TexturePath.Replace(TEXT("\\"), TEXT("/"));
+	if (!FPaths::FileExists(TexturePath))
+	{
+		return nullptr;
+	}
+	
+	// Extract relative path from absolute path
+	FString SourceRoot = SourceFbxPath.EndsWith(TEXT("/")) ? SourceFbxPath : SourceFbxPath + TEXT("/");
+	FString RelativePath = TexturePath;
+	int32 GameIndex = RelativePath.Find(SourceRoot, ESearchCase::IgnoreCase);
+	if (GameIndex != INDEX_NONE)
+	{
+		RelativePath = RelativePath.RightChop(GameIndex + SourceRoot.Len());
+		RelativePath = FPaths::GetPath(RelativePath);
+	}
+	else
+	{
+		RelativePath = FPaths::GetPath(FPaths::GetBaseFilename(TexturePath));
+	}
+	
+	FString TargetUEPath = _TargetUEPath.EndsWith(TEXT("/")) ? _TargetUEPath : _TargetUEPath + TEXT("/");
+	FString DestPath = TargetUEPath + RelativePath;
+	UTexture2D* Texture = ImportTextureFromFile(TexturePath, DestPath, bSRGB, LODGroup);
+	
+	// Apply compression settings if texture was imported
+	if (Texture && CompressionSettings != TC_Default)
+	{
+		Texture->CompressionSettings = CompressionSettings;
+		Texture->UpdateResource();
+	}
+	
+	return Texture;
+}
+
+// Helper function: Import material from JSON
+static void ImportMaterialFromJson(const FString& JsonPath, const FString& TargetUEPath, const FString& SourceFbxPath, const TArray<FString>& ImportedObjectPaths, UObject* ParentMaterialAsset)
+{
+	// Check if JSON file exists
+	if (!FPaths::FileExists(JsonPath))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ImportMaterialFromJson: JSON file does not exist: %s"), *JsonPath);
+		return;
+	}
+	
+	// Load JSON file
+	FString JsonString;
+	if (!FFileHelper::LoadFileToString(JsonString, *JsonPath))
+	{
+		UE_LOG(LogTemp, Error, TEXT("Failed to load JSON file: %s"), *JsonPath);
+		return;
+	}
+	
+	// Parse JSON
+	TSharedPtr<FJsonObject> JsonObject;
+	TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(JsonString);
+	if (!FJsonSerializer::Deserialize(JsonReader, JsonObject) || !JsonObject.IsValid())
+	{
+		UE_LOG(LogTemp, Error, TEXT("Failed to parse JSON file: %s"), *JsonPath);
+		return;
+	}
+	
+	// Check if parent material is valid
+	UMaterialInterface* ParentMaterial = Cast<UMaterialInterface>(ParentMaterialAsset);
+	if (!ParentMaterial)
+	{
+		UE_LOG(LogTemp, Error, TEXT("ImportMaterialFromJson: ParentMaterialAsset is not a valid material"));
+		return;
+	}
+	
+	// Process each imported object
+	for (const FString& ObjectPath : ImportedObjectPaths)
+	{
+		// Load the imported mesh
+		UObject* LoadedObject = LoadObject<UObject>(nullptr, *ObjectPath);
+		if (!LoadedObject)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Failed to load imported object: %s"), *ObjectPath);
+			continue;
+		}
+		
+		// Get material slots
+		TArray<FName> MaterialSlotNames;
+		TArray<UMaterialInterface*> Materials;
+		
+		if (UStaticMesh* StaticMesh = Cast<UStaticMesh>(LoadedObject))
+		{
+			// Get static mesh materials
+			for (const FStaticMaterial& StaticMaterial : StaticMesh->GetStaticMaterials())
+			{
+				MaterialSlotNames.Add(StaticMaterial.MaterialSlotName);
+				Materials.Add(StaticMaterial.MaterialInterface);
+			}
+		}
+		else if (USkeletalMesh* SkeletalMesh = Cast<USkeletalMesh>(LoadedObject))
+		{
+			// Get skeletal mesh materials
+			for (const FSkeletalMaterial& SkeletalMaterial : SkeletalMesh->GetMaterials())
+			{
+				MaterialSlotNames.Add(SkeletalMaterial.MaterialSlotName);
+				Materials.Add(SkeletalMaterial.MaterialInterface);
+			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Imported object is not a mesh: %s"), *ObjectPath);
+			continue;
+		}
+		
+		// Get mesh directory for material instance creation
+		FString MeshPackagePath = FPaths::GetPath(ObjectPath);
+		
+		// Process each material slot
+		for (int32 SlotIndex = 0; SlotIndex < MaterialSlotNames.Num(); SlotIndex++)
+		{
+			FString MaterialSlotName = MaterialSlotNames[SlotIndex].ToString();
+			
+			// Find material in JSON
+			if (!JsonObject->HasField(MaterialSlotName))
+			{
+				UE_LOG(LogTemp, Warning, TEXT("Material not found in JSON: %s"), *MaterialSlotName);
+				continue;
+			}
+			
+			TSharedPtr<FJsonObject> MaterialJson = JsonObject->GetObjectField(MaterialSlotName);
+			if (!MaterialJson.IsValid() || !MaterialJson->HasField(TEXT("Classified")))
+			{
+				UE_LOG(LogTemp, Warning, TEXT("Material JSON missing Classified field: %s"), *MaterialSlotName);
+				continue;
+			}
+			
+			TSharedPtr<FJsonObject> ClassifiedJson = MaterialJson->GetObjectField(TEXT("Classified"));
+			
+			// Import textures from Classified field
+			UTexture2D* DiffuseTexture = nullptr;
+			UTexture2D* NormalTexture = nullptr;
+			UTexture2D* RoughnessTexture = nullptr;
+			UTexture2D* MetallicTexture = nullptr;
+						
+			// Import textures from Classified field
+			if (ClassifiedJson->HasField(TEXT("Diffuse")))
+			{
+				FString DiffusePath = ClassifiedJson->GetStringField(TEXT("Diffuse"));
+				DiffuseTexture = ImportTextureWithRelativePath(DiffusePath, TargetUEPath, SourceFbxPath, true);
+			}
+			
+			if (ClassifiedJson->HasField(TEXT("Normal")))
+			{
+				FString NormalPath = ClassifiedJson->GetStringField(TEXT("Normal"));
+				NormalTexture = ImportTextureWithRelativePath(NormalPath, TargetUEPath, SourceFbxPath, false, TC_Normalmap, TEXTUREGROUP_WorldNormalMap);
+			}
+			
+			if (ClassifiedJson->HasField(TEXT("Roughness")))
+			{
+				FString RoughnessPath = ClassifiedJson->GetStringField(TEXT("Roughness"));
+				RoughnessTexture = ImportTextureWithRelativePath(RoughnessPath, TargetUEPath, SourceFbxPath, false, TC_Masks);
+			}
+			
+			if (ClassifiedJson->HasField(TEXT("Metallic")))
+			{
+				FString MetallicPath = ClassifiedJson->GetStringField(TEXT("Metallic"));
+				MetallicTexture = ImportTextureWithRelativePath(MetallicPath, TargetUEPath, SourceFbxPath, false, TC_Masks);
+			}
+			
+			// Create material instance
+			FString MaterialInstanceName = MaterialSlotName;
+			FString MaterialInstancePackageName = MeshPackagePath / MaterialInstanceName;
+			
+			// Check if material instance already exists
+			UPackage* ExistingMIPackage = FindPackage(nullptr, *MaterialInstancePackageName);
+			UMaterialInstanceConstant* MaterialInstance = nullptr;
+			
+			if (ExistingMIPackage)
+			{
+				MaterialInstance = FindObject<UMaterialInstanceConstant>(ExistingMIPackage, *MaterialInstanceName);
+				if (MaterialInstance)
+				{
+					UE_LOG(LogTemp, Log, TEXT("Material instance already exists, skipping: %s"), *MaterialInstancePackageName);
+				}
+			}
+			
+			if (!MaterialInstance)
+			{
+				// Create new material instance
+				UPackage* MIPackage = CreatePackage(*MaterialInstancePackageName);
+				MIPackage->FullyLoad();
+				
+				MaterialInstance = NewObject<UMaterialInstanceConstant>(
+					MIPackage,
+					*MaterialInstanceName,
+					RF_Standalone | RF_Public
+				);
+				
+				if (MaterialInstance)
+				{
+					// Set parent material
+					MaterialInstance->SetParentEditorOnly(ParentMaterial);
+					
+					// Notify asset registry
+					FAssetRegistryModule::AssetCreated(MaterialInstance);
+					MIPackage->MarkPackageDirty();
+					
+					UE_LOG(LogTemp, Log, TEXT("Created material instance: %s"), *MaterialInstancePackageName);
+				}
+			}
+			
+			// Set texture parameters on material instance
+			if (MaterialInstance)
+			{
+				bool bModified = false;
+				
+				if (DiffuseTexture)
+				{
+					MaterialInstance->SetTextureParameterValueEditorOnly(FName(TEXT("BaseColorTexture")), DiffuseTexture);
+					bModified = true;
+				}
+				
+				if (NormalTexture)
+				{
+					MaterialInstance->SetTextureParameterValueEditorOnly(FName(TEXT("NormalTexture")), NormalTexture);
+					bModified = true;
+				}
+				
+				if (RoughnessTexture)
+				{
+					MaterialInstance->SetTextureParameterValueEditorOnly(FName(TEXT("RoughnessTexture")), RoughnessTexture);
+					bModified = true;
+				}
+				
+				if (MetallicTexture)
+				{
+					MaterialInstance->SetTextureParameterValueEditorOnly(FName(TEXT("MetallicTexture")), MetallicTexture);
+					bModified = true;
+				}
+				
+				if (bModified)
+				{
+					MaterialInstance->PostEditChange();
+				}
+				
+				// Apply material instance to mesh slot
+				if (UStaticMesh* StaticMesh = Cast<UStaticMesh>(LoadedObject))
+				{
+					StaticMesh->SetMaterial(SlotIndex, MaterialInstance);
+					StaticMesh->PostEditChange();
+					UE_LOG(LogTemp, Log, TEXT("Applied material instance to static mesh slot %d"), SlotIndex);
+				}
+				else if (USkeletalMesh* SkeletalMesh = Cast<USkeletalMesh>(LoadedObject))
+				{
+					SkeletalMesh->GetMaterials()[SlotIndex].MaterialInterface = MaterialInstance;
+					SkeletalMesh->PostEditChange();
+					UE_LOG(LogTemp, Log, TEXT("Applied material instance to skeletal mesh slot %d"), SlotIndex);
+				}
+			}
+		}
+	}
+}
+#endif
+
+bool UUEMeshBPExportFuncsBPLibrary::ImportMesh(const FString& TargetUEPath, const FString& SourceFbxPath, const FString& MeshName, bool bImportMaterial, bool bImportSkeleton, UObject* ParentMaterialAsset, float Scale)
 {
 #if WITH_EDITOR
+	FString MeshBaseName = FPaths::GetBaseFilename(MeshName);
+	FString MeshPath = FPaths::Combine(SourceFbxPath, MeshName);
 	// Check if file exists
 	if (!FPaths::FileExists(MeshPath))
 	{
@@ -529,8 +878,8 @@ bool UUEMeshBPExportFuncsBPLibrary::ImportMesh(const FString& TargetUEPath, cons
 		FbxFactory->ImportUI->bImportMesh = true;
 		
 		// Enforce material/texture/animation/physics import flags
-		FbxFactory->ImportUI->bImportMaterials = bImportMaterial;
-		FbxFactory->ImportUI->bImportTextures = bImportTexture;
+		FbxFactory->ImportUI->bImportMaterials = false;
+		FbxFactory->ImportUI->bImportTextures = false;
 		FbxFactory->ImportUI->bImportAnimations = false;
 		FbxFactory->ImportUI->bCreatePhysicsAsset = false;
 
@@ -546,12 +895,13 @@ bool UUEMeshBPExportFuncsBPLibrary::ImportMesh(const FString& TargetUEPath, cons
 	
 	// Create import task
 	UAssetImportTask* ImportTask = NewObject<UAssetImportTask>();
+	FString UEMeshPath = FPaths::Combine(TargetUEPath, MeshBaseName);
 	ImportTask->AddToRoot();
 	ImportTask->bAutomated = true;
 	ImportTask->bReplaceExisting = true;
 	ImportTask->bSave = false;
 	ImportTask->Filename = MeshPath;
-	ImportTask->DestinationPath = TargetUEPath;
+	ImportTask->DestinationPath = UEMeshPath;
 	ImportTask->Factory = FbxFactory;
 	ImportTask->Options = FbxFactory->ImportUI;
 	
@@ -582,6 +932,12 @@ bool UUEMeshBPExportFuncsBPLibrary::ImportMesh(const FString& TargetUEPath, cons
 	
 	// Clean up
 	ImportTask->RemoveFromRoot();
+	
+	if (bImportMaterial)
+	{
+		FString JsonPath = MeshPath.Replace(TEXT(".fbx"), TEXT(".json"));
+		ImportMaterialFromJson(JsonPath, TargetUEPath, SourceFbxPath, ImportTask->ImportedObjectPaths, ParentMaterialAsset);
+	}
 	
 	return bSuccess;
 #else
